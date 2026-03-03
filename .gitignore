@@ -1,0 +1,11 @@
+# Claves y configuración
+.env
+
+# Archivos de memoria e historiales
+*.json
+*.csv
+
+# Carpetas ocultas de Python y entornos virtuales
+__pycache__/
+venv/
+.vscode/
