@@ -6,6 +6,7 @@ import time
 import schedule
 import json 
 import os
+import sys
 import requests
 from dotenv import load_dotenv
 from datetime import datetime
@@ -15,6 +16,7 @@ import brain_ia
 load_dotenv()
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
+ADMIN_PASSWORD = os.getenv('BOT_PASSWORD') # Contraseña del Kill Switch
 
 # --- CARTERA ---
 WATCHLIST = [
@@ -34,6 +36,13 @@ STOP_LOSS_PCT = 0.015   # Perder máx 1.5%
 # --- 2. FUNCIONES DE APOYO Y MEMORIA ---
 ARCHIVO_MEMORIA = "historial_bot.json"
 ultimo_update_id = 0 # Para rastrear los clics en Telegram
+
+# Estado global de seguridad para el Kill Switch
+estado_seguridad = {
+    "esperando_password": False,
+    "accion_pendiente": "",
+    "chat_id_esperando": None
+}
 
 def cargar_memoria():
     if os.path.exists(ARCHIVO_MEMORIA):
@@ -57,10 +66,11 @@ def send_telegram_alert(mensaje, incluir_botones=False):
     payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
     
     if incluir_botones:
+        # Botones acomodados en pares para no saturar la pantalla del celular
         teclado = {
             "inline_keyboard": [
-                [{"text": "📊 Resumen de Hoy", "callback_data": "btn_hoy"}],
-                [{"text": "🌍 Resumen Global", "callback_data": "btn_global"}]
+                [{"text": "📊 Resumen de Hoy", "callback_data": "btn_hoy"}, {"text": "🌍 Resumen Global", "callback_data": "btn_global"}],
+                [{"text": "🛑 Vender todo", "callback_data": "btn_vender"}, {"text": "☠️ Desactivar bot", "callback_data": "btn_apagar"}]
             ]
         }
         payload["reply_markup"] = json.dumps(teclado)
@@ -69,8 +79,33 @@ def send_telegram_alert(mensaje, incluir_botones=False):
         requests.post(url, json=payload, timeout=5)
     except: pass
 
+def initialize_exchange():
+    return ccxt.binance({
+        'apiKey': API_KEY,
+        'secret': SECRET_KEY,
+        'options': {'defaultType': 'future'},
+        'enableRateLimit': True
+    })
+
+def cerrar_todas_las_posiciones():
+    try:
+        exchange = initialize_exchange()
+        posiciones = exchange.fetch_positions()
+        cerradas = 0
+        for pos in posiciones:
+            amt = float(pos['info']['positionAmt'])
+            symbol = pos['symbol']
+            if amt != 0:
+                side = 'sell' if amt > 0 else 'buy'
+                # Parche de seguridad: reduceOnly asegura que NUNCA abra una posición inversa por accidente
+                exchange.create_order(symbol, 'market', side, abs(amt), params={'reduceOnly': True})
+                cerradas += 1
+        return True, f"✅ Éxito. Se cerraron {cerradas} posiciones abiertas a precio de mercado."
+    except Exception as e:
+        return False, f"❌ Error crítico cerrando posiciones: {str(e)}"
+
 def escuchar_botones_telegram():
-    global ultimo_update_id
+    global ultimo_update_id, estado_seguridad
     token = os.getenv('TELEGRAM_TOKEN')
     if not token: return
     
@@ -81,12 +116,52 @@ def escuchar_botones_telegram():
         if respuesta.get("ok"):
             for resultado in respuesta["result"]:
                 ultimo_update_id = resultado["update_id"]
+                
+                # A. Capturar texto si el bot está esperando la contraseña
+                if "message" in resultado and "text" in resultado["message"]:
+                    chat_id = resultado["message"]["chat"]["id"]
+                    mensaje_id = resultado["message"]["message_id"]
+                    texto = resultado["message"]["text"]
+                    
+                    if estado_seguridad["esperando_password"] and str(chat_id) == str(estado_seguridad["chat_id_esperando"]):
+                        # 1. Borrar el mensaje con la clave por seguridad
+                        requests.post(f"https://api.telegram.org/bot{token}/deleteMessage", json={"chat_id": chat_id, "message_id": mensaje_id})
+                        
+                        # 2. Validar clave
+                        if texto == ADMIN_PASSWORD:
+                            send_telegram_alert("✅ Contraseña verificada. Ejecutando protocolo de emergencia, espera...")
+                            exito, msj_resultado = cerrar_todas_las_posiciones()
+                            send_telegram_alert(msj_resultado)
+                            
+                            if exito and estado_seguridad["accion_pendiente"] == "apagar":
+                                send_telegram_alert("🔌 Apagando sistema principal. El bot dejará de operar ahora.")
+                                sys.exit(0) # Apaga el script de Python
+                        else:
+                            send_telegram_alert("❌ Contraseña incorrecta. Protocolo abortado.")
+                        
+                        # 3. Resetear el estado de seguridad
+                        estado_seguridad["esperando_password"] = False
+                        estado_seguridad["accion_pendiente"] = ""
+                        estado_seguridad["chat_id_esperando"] = None
+
+                # B. Capturar clics en los botones
                 if "callback_query" in resultado:
                     datos_boton = resultado["callback_query"]["data"]
+                    chat_id = resultado["callback_query"]["message"]["chat"]["id"]
+                    
                     if datos_boton == "btn_hoy":
                         enviar_resumen_diario(resetear=False)
                     elif datos_boton == "btn_global":
                         enviar_resumen_global()
+                    elif datos_boton in ["btn_vender", "btn_apagar"]:
+                        # Activar el modo espera de contraseña
+                        estado_seguridad["esperando_password"] = True
+                        estado_seguridad["accion_pendiente"] = "apagar" if datos_boton == "btn_apagar" else "vender"
+                        estado_seguridad["chat_id_esperando"] = chat_id
+                        
+                        accion_str = "🛑 Vender Todo" if datos_boton == "btn_vender" else "☠️ Desactivar Bot"
+                        send_telegram_alert(f"⚠️ ALERTA DE SEGURIDAD: Has solicitado {accion_str}.\n\nPor favor, escribe tu contraseña de administrador para confirmar:")
+
     except Exception:
         pass # Ignoramos errores leves de red para no frenar el bot
 
@@ -100,14 +175,6 @@ def registrar_datos_csv(activo, precio, rsi, slope, accion, saldo):
             csv.writer(f).writerow(cabecera)
     with open(archivo, 'a', newline='') as f:
         csv.writer(f).writerow(datos)
-
-def initialize_exchange():
-    return ccxt.binance({
-        'apiKey': API_KEY,
-        'secret': SECRET_KEY,
-        'options': {'defaultType': 'future'},
-        'enableRateLimit': True
-    })
 
 # --- 3. LÓGICA DE TRADING ---
 
@@ -319,8 +386,8 @@ def ciclo_maestro():
         print(f"Error de conexión: {e}")
 
 # --- 4. EJECUCIÓN ---
-print("--- 🤖 MF1MDB V5.1: CLOUD EDITION ---")
-send_telegram_alert("☁️ Bot Iniciado en la Nube con Interfaz Interactiva.", incluir_botones=True)
+print("--- 🤖 MF1MDB V5.2: KILL SWITCH ACTIVATED ---")
+send_telegram_alert("☁️ Bot Iniciado. Sistemas de emergencia activados.", incluir_botones=True)
 
 schedule.every(1).minutes.do(ciclo_maestro)
 schedule.every().day.at("22:00").do(enviar_resumen_diario)
